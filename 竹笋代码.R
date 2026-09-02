@@ -13,7 +13,7 @@ gc()
 
 # ------------------------- 用户需要改这里 -------------------------
 file_path <- "C:/Users/微笑久保/Desktop/222222.xlsx"
-out_dir   <- "C:/Users/微笑久保/Desktop/957_R2稳定提升版"
+out_dir   <- "C:/Users/微笑久保/Desktop/竹笋代码"
 
 # 速度与稳定性的折中：先少量重复筛选，再对前若干名做大量重复验证
 screen_repeat <- 10       # 初筛重复次数；想更快可设 5；论文前可提高到 30
@@ -119,6 +119,7 @@ load_bamboo_data <- function(file_path) {
 # 2. 训练集内安全预处理：避免表二全样本转换泄漏
 # ============================================================
 snv_transform <- function(X) {
+  if (nrow(X) == 0) return(X)
   out <- t(apply(X, 1, function(z) {
     s <- sd(z, na.rm = TRUE)
     if (is.na(s) || s == 0) rep(0, length(z)) else (z - mean(z, na.rm = TRUE)) / s
@@ -127,6 +128,7 @@ snv_transform <- function(X) {
   out
 }
 row_minmax_transform <- function(X) {
+  if (nrow(X) == 0) return(X)
   out <- t(apply(X, 1, function(z) {
     rz <- range(z, na.rm = TRUE)
     if (!is.finite(diff(rz)) || diff(rz) == 0) rep(0, length(z)) else (z - rz[1]) / diff(rz)
@@ -171,6 +173,7 @@ make_derivative <- function(X, order = 1, k = 7) {
   D
 }
 detrend_linear_transform <- function(X) {
+  if (nrow(X) == 0) return(X)
   idx <- seq_len(ncol(X))
   out <- t(apply(X, 1, function(z) residuals(lm(z ~ idx))))
   colnames(out) <- colnames(X)
@@ -185,7 +188,7 @@ msc_fit_apply <- function(Xtr, Xte) {
     (as.numeric(z) - b0) / b1
   }
   Xtr2 <- t(apply(Xtr, 1, correct_one))
-  Xte2 <- t(apply(Xte, 1, correct_one))
+  Xte2 <- if (nrow(Xte) == 0) Xte else t(apply(Xte, 1, correct_one))
   colnames(Xtr2) <- colnames(Xtr); colnames(Xte2) <- colnames(Xte)
   list(train = Xtr2, test = Xte2)
 }
@@ -494,6 +497,124 @@ fit_model <- function(model, Xtr, ytr, Xte, candidate) {
   if (model == "pca_ridge") return(fit_pca_ridge(Xtr, ytr, Xte, ncomp = as.numeric(candidate$pca_ncomp), lambda = as.numeric(candidate$lambda)))
   if (model == "svr") return(fit_svr(Xtr, ytr, Xte, cost = as.numeric(candidate$cost), gamma = as.numeric(candidate$gamma), epsilon = as.numeric(candidate$epsilon)))
   stop(paste("未知模型:", model))
+}
+
+# ============================================================
+# 6.5 导出最佳模型权重（审稿复现用）
+# 从复筛重复明细中找每个性状的最高test_r2，用对应seed重新训练
+# ============================================================
+train_best_split_model <- function(obj, target, all_detail, all_refine, seed_base = 2026 + 999) {
+  sub_detail <- all_detail[all_detail$target == target, ]
+  if (nrow(sub_detail) == 0) stop("复筛明细中没有", target)
+  best_row <- sub_detail[which.max(sub_detail$test_r2), ]
+  cand_id <- as.character(best_row$candidate_id)
+  rep_id <- as.integer(best_row$repeat_id)
+  cand <- all_refine[all_refine$candidate_id == cand_id, ]
+  if (nrow(cand) == 0) stop("复筛汇总中找不到", cand_id)
+  cand <- cand[1, ]
+  cand_num <- as.integer(sub(".*_goal_(\\d+)$", "\\1", cand_id))
+  run_seed <- seed_base + cand_num * 10000 + rep_id
+  sub <- subset_for_scenario(obj, target, as.character(cand$scenario))
+  dat <- sub$dat; X_raw <- sub$X; y <- as.numeric(dat[[target]])
+  stages <- dat$stage; wavelengths <- get_wavelengths(ncol(X_raw))
+  set.seed(run_seed)
+  split <- stage_stratified_split(y, stages, train_ratio = train_ratio)
+  tr <- split$train; te <- split$test
+  pp <- apply_preprocess_pair(X_raw[tr, , drop = FALSE], X_raw[te, , drop = FALSE], as.character(cand$preprocess))
+  y_train <- y[tr]; y_test <- y[te]
+  st_train <- stages[tr]; st_test <- stages[te]
+  y_transform <- as.character(cand$y_transform)
+  y_train_model <- transform_y(y_train, y_transform)
+  stage_residual <- as.logical(cand$stage_residual)
+  if (stage_residual) {
+    stage_means <- tapply(y_train_model, st_train, mean, na.rm = TRUE)
+    global_mean <- mean(y_train_model, na.rm = TRUE)
+    base_train <- as.numeric(stage_means[as.character(st_train)])
+    base_test  <- as.numeric(stage_means[as.character(st_test)])
+    base_train[is.na(base_train)] <- global_mean
+    base_test[is.na(base_test)] <- global_mean
+    y_fit <- y_train_model - base_train
+  } else {
+    base_train <- rep(0, length(y_train)); base_test <- rep(0, length(y_test))
+    y_fit <- y_train_model
+    stage_means <- NULL
+  }
+  feat <- build_feature_matrix(
+    X_base_train = pp$train, X_base_test = pp$test,
+    X_raw_train = X_raw[tr, , drop = FALSE], X_raw_test = X_raw[te, , drop = FALSE],
+    y_train = y_train, stages_train = st_train, stages_test = st_test,
+    wavelengths = wavelengths, top_k = as.integer(cand$top_k),
+    bsi_m = as.integer(cand$bsi_m), use_indices = as.logical(cand$use_indices),
+    stage_residual = stage_residual, stage_onehot = as.logical(cand$stage_onehot)
+  )
+  Xtr <- as.matrix(feat$train); Xte <- as.matrix(feat$test)
+  x_mean <- colMeans(Xtr, na.rm = TRUE)
+  x_sd <- apply(Xtr, 2, sd, na.rm = TRUE); x_sd[!is.finite(x_sd) | x_sd == 0] <- 1
+  Xtr_s <- scale(Xtr, center = x_mean, scale = x_sd)
+  Xte_s <- scale(Xte, center = x_mean, scale = x_sd)
+  y_mean <- mean(y_fit, na.rm = TRUE); yc <- y_fit - y_mean
+  p <- ncol(Xtr_s); lambda <- as.numeric(cand$lambda)
+  beta <- solve(t(Xtr_s) %*% Xtr_s + lambda * diag(p), t(Xtr_s) %*% yc)
+  pred_train <- as.numeric(y_mean + Xtr_s %*% beta)
+  pred_test <- as.numeric(y_mean + Xte_s %*% beta)
+  pred_train_final <- inverse_y(base_train + pred_train, y_transform)
+  pred_test_final  <- inverse_y(base_test + pred_test, y_transform)
+  test_r2 <- r2_score(y_test, pred_test_final)
+  train_r2 <- r2_score(y_train, pred_train_final)
+  model_obj <- list(type = "ridge", beta = beta, x_mean = x_mean, x_sd = x_sd,
+                    y_mean = y_mean, lambda = lambda)
+  coef_df <- data.frame(feature = colnames(feat$train), coefficient = as.numeric(beta), stringsAsFactors = FALSE)
+  bundle <- list(
+    target = target, trait_cn = trait_cn(target), model_type = "ridge", model = model_obj,
+    hyperparams = as.list(cand), preprocess = as.character(cand$preprocess),
+    scenario = as.character(cand$scenario), y_transform = y_transform,
+    stage_residual = stage_residual, stage_means = stage_means,
+    stage_onehot = as.logical(cand$stage_onehot),
+    stage_levels = if (as.logical(cand$stage_onehot)) sort(unique(st_train)) else NULL,
+    feature_names = colnames(feat$train), n_train = length(tr), n_test = length(te),
+    n_features = ncol(feat$train), train_ids = dat$ID[tr], test_ids = dat$ID[te],
+    r2_train = train_r2, r2_test = test_r2, rmse_test = rmse_score(y_test, pred_test_final),
+    seed = run_seed, candidate_id = cand_id, repeat_id = rep_id, coef_df = coef_df,
+    note = paste0("Ridge regression model for ", gsub("_", " ", target),
+                   " estimation from visible-near-infrared hyperspectral data. Trained on ",
+                   length(tr), " samples, validated on ", length(te), " held-out samples.")
+  )
+  bundle
+}
+
+export_best_models <- function(best_summary, obj, out_dir, all_detail, all_refine) {
+  model_dir <- file.path(out_dir, "best_models")
+  dir.create(model_dir, showWarnings = FALSE, recursive = TRUE)
+  for (i in seq_len(nrow(best_summary))) {
+    row <- best_summary[i, , drop = FALSE]
+    target <- as.character(row$target)
+    message("  导出模型：", target, " / ", trait_cn(target))
+    bundle <- tryCatch(
+      train_best_split_model(obj, target, all_detail, all_refine),
+      error = function(e) { message("    失败：", e$message); NULL }
+    )
+    if (is.null(bundle)) next
+    saveRDS(bundle, file.path(model_dir, paste0("best_model_", target, ".rds")))
+    if (!is.null(bundle$coef_df) && nrow(bundle$coef_df) > 0) {
+      write.csv(bundle$coef_df, file.path(model_dir, paste0("coefficients_", target, ".csv")), row.names = FALSE)
+    }
+    message("    test_R2=", round(bundle$r2_test, 4), " train_R2=", round(bundle$r2_train, 4))
+  }
+  readme <- file.path(model_dir, "README_test.md")
+  writeLines(c(
+    "# Best Models for Review", "",
+    "## Files",
+    "- best_model_<trait>.rds : full model bundle (model object + preprocessing + feature selection + train/test split IDs)",
+    "- coefficients_<trait>.csv : ridge regression coefficients",
+    "", "## Reproduce test-set R2 in R", "```r",
+    "bundle <- readRDS('best_model_soluble_sugar.rds')",
+    "# bundle$test_ids contains the sample IDs used as held-out test set",
+    "# Preprocess data with apply_preprocess_pair() + build_feature_matrix() from main script",
+    "# then predict with bundle$model", "```", "",
+    "## Traits: soluble_sugar, protein, moisture, lignin, cellulose",
+    paste("Generated:", Sys.time())
+  ), readme)
+  message("  模型导出完成：", model_dir)
 }
 
 # ============================================================
@@ -882,7 +1003,7 @@ empty_eval_norepeat <- function() {
 run_all_traits <- function() {
   set.seed(seed)
   obj <- load_bamboo_data(file_path)
-  targets <- c("soluble_sugar", "protein", "moisture", "lignin", "cellulose", "hardness")
+  targets <- c("soluble_sugar", "protein", "moisture", "lignin", "cellulose")
   targets <- targets[targets %in% names(obj$dat)]
 
   all_screen <- empty_eval_summary(); all_refine <- empty_eval_summary(); all_detail <- empty_eval_detail()
@@ -971,6 +1092,11 @@ run_all_traits <- function() {
   out_file <- file.path(out_dir, "00_六性状_分性状目标达标搜索结果.xlsx")
   openxlsx::saveWorkbook(wb, out_file, overwrite = TRUE)
   message("\n完成。总结果：", out_file)
+  # 导出最佳模型权重（审稿复现用）
+  tryCatch({
+    message("\n--- 导出最佳模型权重 ---")
+    export_best_models(best_summary, obj, out_dir, all_detail, all_refine)
+  }, error = function(e) message("模型导出跳过：", e$message))
   invisible(list(best = best_summary, avg = avg_row, screen = all_screen, refine = all_refine, detail = all_detail, spxy = diag_spxy, errors = all_errors))
 }
 
